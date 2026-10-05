@@ -1,0 +1,70 @@
+name: Bot ORB backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      dias:
+        description: "Sesiones del backtest"
+        type: string
+        default: "250"
+      coste:
+        description: "Coste ida y vuelta en fracción del precio (0.0010 = 0,10 %)"
+        type: string
+        default: "0.0010"
+      direccion:
+        description: "Direcciones a operar"
+        type: choice
+        options:
+          - ambos
+          - largos
+        default: ambos
+
+concurrency:
+  group: bot-orb
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install alpaca-py pandas numpy
+
+      - name: Ejecutar el backtest
+        shell: bash
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+          BACKTEST_DIAS: ${{ inputs.dias }}
+          COSTE_PCT: ${{ inputs.coste }}
+          DIRECCION: ${{ inputs.direccion }}
+        run: |
+          echo "Sesiones: $BACKTEST_DIAS | Coste: $COSTE_PCT | Direccion: $DIRECCION"
+          python bot_orb.py backtest 2>&1 | tee resumen_orb.txt
+
+      - name: Mostrar resumen en la pagina de la ejecucion
+        if: always()
+        shell: bash
+        run: |
+          if [ -f resumen_orb.txt ]; then
+            { echo '```'; cat resumen_orb.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados-orb-${{ github.run_id }}
+          path: |
+            resumen_orb.txt
+            backtest_orb.csv
+          if-no-files-found: ignore
