@@ -42,8 +42,8 @@ jobs:
       - name: Ejecutar el backtest
         shell: bash
         env:
-          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+          API_KEY_ORB: ${{ secrets.API_KEY_ORB }}
+          SECRET_KEY_ORB: ${{ secrets.SECRET_KEY_ORB }}
           BACKTEST_DIAS: ${{ inputs.dias }}
           COSTE_PCT: ${{ inputs.coste }}
           DIRECCION: ${{ inputs.direccion }}
