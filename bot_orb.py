@@ -54,16 +54,18 @@ NY = ZoneInfo("America/New_York")
 
 # Universo candidato (editable). Para ORB conviene un universo amplio con acciones "en movimiento".
 POOL = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO", "NFLX",
-    "MU", "PLTR", "COIN", "MSTR", "UBER", "SHOP", "CRWD", "PANW", "ARM", "INTC",
-    "QCOM", "BA", "JPM", "BAC", "C", "GS", "XOM", "CVX", "OXY", "LLY",
-    "PFE", "MRNA", "SOFI", "HOOD", "RIVN", "SNAP", "ROKU", "DKNG", "ABNB", "PYPL",
-    "DIS", "NKE", "SBUX", "WMT", "COST", "HD", "F", "GM", "T", "CSCO",
-    "ORCL", "CRM", "ADBE", "NOW", "SNOW", "SMCI", "MARA", "RIOT", "AFRM", "UPST",
-    "RBLX", "TSM", "BABA", "NIO", "SPY", "QQQ", "IWM", "XLE", "XLF", "ARKK",
+    "AAPL",# "MSFT", 
+"NVDA", #"AMZN", "GOOGL", "META", 
+"TSLA", #"AMD", "AVGO", "NFLX",
+    "QQQ",#"MU", "PLTR", "COIN", "MSTR", #"UBER", "SHOP", "CRWD", "PANW", "ARM", #"INTC",
+   # "QCOM", "BA", "JPM", "BAC", "C", #"GS", "XOM", "CVX", "OXY", "LLY",
+   # "PFE", "MRNA", "SOFI", "HOOD", #"RIVN", #"SNAP", "ROKU", "DKNG", "ABNB", #"PYPL",
+  #  "DIS", "NKE", "SBUX", "WMT", "COST", #"HD", "F", "GM", "T", "CSCO",
+   # "ORCL", "CRM", "ADBE", "NOW", "SNOW", #"SMCI", "MARA", "RIOT", "AFRM", "UPST",
+ #   "RBLX", "TSM", "BABA", "NIO", "SPY", #"QQQ", "IWM", "XLE", "XLF", "ARKK",
 ]
 
-N_TOP = 20                  # nº de "stocks in play" por día
+N_TOP = 3                 # nº de "stocks in play" por día
 RV_MIN = 1.0                # volumen relativo mínimo (1.0 = igual que la media)
 RV_VENTANA = 14             # días para la media de volumen de la vela de apertura
 RV_MIN_HIST = 10            # mínimo de días de historia para calcular RV
