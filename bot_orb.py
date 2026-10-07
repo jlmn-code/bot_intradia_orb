@@ -1,32 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Backtest de Opening Range Breakout (ORB) sobre "stocks in play" (Alpaca, solo datos)
+Bot ORB 15 minutos (Opening Range Breakout) - Alpaca, SOLO PAPER TRADING
+Implementa las pautas de orb.txt. No hay modo backtest: opera de verdad en la cuenta paper.
 
-Basado en la idea de Zarattini, Barbon y Aziz (2023), simplificada. NO envía órdenes:
-solo descarga datos históricos y simula la estrategia.
+Reglas (por símbolo, solo largos)
+  1. Rango de apertura = 9:30-9:45 NY (máximo y mínimo de esos 15 minutos).
+  2. Entrada: si el precio rompe el MÁXIMO del rango, compra a mercado. Si no rompe, no se opera.
+  3. Stop loss en el MÍNIMO del rango (orden stop enviada junto a la compra, tipo OTO).
+  4. Sin take profit: se aprovecha la tendencia del día.
+  5. Salida: el modo "cierre" cancela el stop y cierra la posición al final de la sesión (15:35-15:50 NY).
 
-Reglas (por sesión)
-  1. Universo del día (con datos hasta AYER): precio >= 5 $, volumen medio 14 días >= 1M acciones, ATR(14) >= 0,50 $.
-  2. Vela de apertura = primera vela de 5 min (9:30-9:35 NY).
-  3. Volumen relativo (RV) = volumen de esa vela / media del volumen de la misma vela en los 14 días anteriores.
-  4. "Stocks in play" = las N_TOP (20) con mayor RV y RV >= 1.
-  5. Dirección: vela alcista -> solo LARGO; vela bajista -> solo CORTO; doji -> no se opera.
-  6. Entrada: orden stop en el máximo (largo) o mínimo (corto) de la vela de apertura.
-  7. Stop loss = 10 % del ATR(14) diario desde la entrada. Sin take profit: salida al cierre de la sesión.
-  8. Riesgo 1 % del capital por operación, apalancamiento total máximo 4x (aprox.).
+Cómo funciona (importante)
+  Alpaca NO permite una orden de entrada "stop" (comprar al romper) con el stop loss adjunto: la entrada
+  en una orden OTO solo puede ser a mercado o límite. Por eso el modo "entrada" es un proceso que dura
+  hasta ENTRADA_HASTA (11:00 NY): espera a las 9:45, calcula el rango y vigila el precio cada POLL_SEG
+  segundos; en cuanto un símbolo supera su máximo envía la compra a mercado con el stop adjunto.
 
-Comparación: el mismo universo líquido eligiendo al azar el mismo número de símbolos cada día,
-con las mismas reglas de dirección, entrada y stop. Si el filtro de volumen relativo no aporta,
-la estrategia no debería superar al azar.
+Modos:   python bot_orb.py entrada | cierre
+Credenciales (claves de PAPER): API_KEY_ORB / SECRET_KEY_ORB (o APCA_API_KEY_ID / APCA_API_SECRET_KEY).
+DRY_RUN: solo es False si la variable de entorno DRY_RUN vale false/0/no.
+FEED_DATOS: "iex" (por defecto, gratis y en tiempo real, aunque solo recoge operaciones de IEX) o "sip" (plan de pago).
 
-Uso:   python bot_orb.py backtest
-Variables de entorno (opcionales):
-  BACKTEST_DIAS (250), COSTE_PCT (0.0010 = 0,10 % ida y vuelta, spread + deslizamiento),
-  DIRECCION (ambos | largos)
-Credenciales: APCA_API_KEY_ID / APCA_API_SECRET_KEY (sirven las de paper).
-
-AVISO: herramienta de aprendizaje. Con stops tan cortos el coste por operación pesa muchísimo:
-mira la tabla de sensibilidad al coste antes de sacar conclusiones.
+AVISO: herramienta de aprendizaje. Las cifras de orb.txt son estimaciones sin verificar, no una ventaja demostrada.
 """
 
 import os
@@ -34,63 +29,53 @@ import sys
 import csv
 import math
 import time
-import random
-from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
-import numpy as np
-import pandas as pd
-
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    MarketOrderRequest, StopLossRequest, GetOrdersRequest, GetCalendarRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed, Adjustment
+from alpaca.data.enums import DataFeed
 
 # ==========================================================
 # CONFIGURACIÓN
 # ==========================================================
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in ("false", "0", "no")
+FEED = DataFeed.SIP if os.environ.get("FEED_DATOS", "iex").strip().lower() == "sip" else DataFeed.IEX
 NY = ZoneInfo("America/New_York")
+PREFIJO = "orb-"                   # prefijo de client_order_id: el cierre solo toca lo de este bot
+LOG_CSV = "registro_orb.csv"
 
-# Universo candidato (editable). Para ORB conviene un universo amplio con acciones "en movimiento".
-POOL = [
-    "AAPL",# "MSFT", 
-"NVDA", #"AMZN", "GOOGL", "META", 
-"TSLA", #"AMD", "AVGO", "NFLX",
-    "QQQ",#"MU", "PLTR", "COIN", "MSTR", #"UBER", "SHOP", "CRWD", "PANW", "ARM", #"INTC",
-   # "QCOM", "BA", "JPM", "BAC", "C", #"GS", "XOM", "CVX", "OXY", "LLY",
-   # "PFE", "MRNA", "SOFI", "HOOD", #"RIVN", #"SNAP", "ROKU", "DKNG", "ABNB", #"PYPL",
-  #  "DIS", "NKE", "SBUX", "WMT", "COST", #"HD", "F", "GM", "T", "CSCO",
-   # "ORCL", "CRM", "ADBE", "NOW", "SNOW", #"SMCI", "MARA", "RIOT", "AFRM", "UPST",
- #   "RBLX", "TSM", "BABA", "NIO", "SPY", #"QQQ", "IWM", "XLE", "XLF", "ARKK",
-]
+# Universo (orb.txt recomienda NVDA, TSLA, AAPL/MSFT y QQQ)
+POOL = ["AAPL", "NVDA", "TSLA", "QQQ"]
 
-N_TOP = 3                 # nº de "stocks in play" por día
-RV_MIN = 1.0                # volumen relativo mínimo (1.0 = igual que la media)
-RV_VENTANA = 14             # días para la media de volumen de la vela de apertura
-RV_MIN_HIST = 10            # mínimo de días de historia para calcular RV
-PRECIO_MIN = 5.0
-VOL_MEDIO_MIN = 1_000_000   # volumen medio diario (14 días) en acciones; solo se aplica con datos SIP
-ATR_MIN = 0.50
-ATR_P = 14
+APERTURA = dtime(9, 30)
+FIN_RANGO = dtime(9, 45)           # el rango son los primeros 15 minutos
+ENTRADA_HASTA = dtime(11, 0)       # no se abren entradas nuevas a partir de esta hora (NY)
+CIERRE_PERMITIDO = (dtime(15, 25), dtime(15, 59))
+POLL_SEG = 15                      # cada cuántos segundos se mira el precio
+MIN_VELAS_RANGO = 12               # de 15 velas de 1 min, mínimo para dar el rango por válido
 
-SL_FRAC_ATR = 0.10          # stop = 10 % del ATR diario
-RIESGO_OP = 0.01            # 1 % del capital arriesgado por operación
-APALANC_MAX = 4.0           # exposición bruta máxima / capital
+# Filtros de seguridad (no vienen de orb.txt)
+MAX_PERSECUCION_PCT = 0.005        # si al detectar la ruptura el precio ya está >0,5 % sobre el máximo, no se persigue
+RIESGO_MIN_PCT = 0.002             # el stop no puede quedar a menos del 0,2 % del precio
+RIESGO_MAX_PCT = 0.03              # si el stop queda a más del 3 %, no se entra
 
-BACKTEST_DIAS = int(os.environ.get("BACKTEST_DIAS", "250"))
-COSTE_PCT = float(os.environ.get("COSTE_PCT", "0.0010"))   # coste ida y vuelta en % del precio
-DIRECCION = os.environ.get("DIRECCION", "ambos").strip().lower()   # ambos | largos
-REPS_ALEATORIO = 50
-COSTES_SENSIBILIDAD = [0.0, 0.0002, 0.0005, 0.0010]
+# Tamaño (orb.txt usa el 100 % del capital en NVDA; aquí se arriesga una fracción para repartir entre símbolos)
+RIESGO_POR_OPERACION = 0.005       # 0,5 % del equity arriesgado por operación
+MAX_POSICION_PCT = 0.25            # máximo 25 % del equity en un símbolo
+MAX_EXPOSICION = 0.80              # máximo 80 % del equity entre todas las posiciones
+MAX_POSICIONES = 4
 
-RETRASO_MIN = 16            # el plan gratis exige >15 min de retraso con SIP
-APERTURA_MIN = 9 * 60 + 30  # minutos desde medianoche (NY)
-CIERRE_MIN = 16 * 60
-CSV_DETALLE = "backtest_orb.csv"
-
+trading_client = None
 data_client = None
-_feed = None                # feed elegido en la primera descarga (SIP o IEX); no se mezclan
+CAMPOS_CSV = ["timestamp", "evento", "simbolo", "qty", "orb_alto", "orb_bajo", "precio", "stop", "pnl", "modo",
+              "orden_id"]
 
 
 # ==========================================================
@@ -102,6 +87,16 @@ def ahora_ny():
 
 def log(msg):
     print(f"[{ahora_ny():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+def registrar_csv(fila):
+    nuevo = not os.path.exists(LOG_CSV)
+    fila = {"timestamp": ahora_ny().isoformat(timespec="seconds"), "modo": "DRY_RUN" if DRY_RUN else "PAPER", **fila}
+    with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CAMPOS_CSV, restval="", extrasaction="ignore")
+        if nuevo:
+            w.writeheader()
+        w.writerow(fila)
 
 
 def secreto(*nombres):
@@ -124,321 +119,280 @@ def secreto(*nombres):
 
 
 def iniciar_clientes():
-    global data_client
-    key = secreto("API_KEY", "APCA_API_KEY_ID")
-    sec = secreto("SECRET_KEY", "APCA_API_SECRET_KEY")
+    global trading_client, data_client
+    key = secreto("API_KEY_ORB", "APCA_API_KEY_ID", "API_KEY")
+    sec = secreto("SECRET_KEY_ORB", "APCA_API_SECRET_KEY", "SECRET_KEY")
     if not key or not sec:
-        log("❌ Faltan credenciales (APCA_API_KEY_ID / APCA_API_SECRET_KEY).")
+        log("❌ Faltan credenciales (API_KEY_ORB / SECRET_KEY_ORB). Usa claves de PAPER TRADING.")
         return False
     data_client = StockHistoricalDataClient(api_key=key, secret_key=sec)
+    trading_client = TradingClient(api_key=key, secret_key=sec, paper=True)
+    try:
+        trading_client.get_account()
+    except Exception as e:
+        if "401" in str(e):
+            log("❌ Alpaca rechaza las credenciales (401): usa las claves de PAPER (empiezan por 'PK').")
+            return False
+        raise
     return True
+
+
+def esperar_hasta(hora, extra_seg=0):
+    objetivo = datetime.combine(ahora_ny().date(), hora, tzinfo=NY) + timedelta(seconds=extra_seg)
+    while True:
+        falta = (objetivo - ahora_ny()).total_seconds()
+        if falta <= 0:
+            return
+        time.sleep(min(15, falta))
+
+
+def fuera_de_franja(rango, nombre):
+    if DRY_RUN:
+        return False
+    t = ahora_ny().time()
+    if ahora_ny().weekday() >= 5 or not (rango[0] <= t <= rango[1]):
+        log(f"⏸️ Modo {nombre}: fuera de la franja permitida {rango[0]:%H:%M}-{rango[1]:%H:%M} NY. No se hace nada.")
+        return True
+    return False
 
 
 # ==========================================================
 # DATOS
 # ==========================================================
-def descargar_barras(simbolos, timeframe, inicio, fin, lote=20):
-    """{simbolo: DataFrame} con índice en hora NY. Usa SIP; si falla en la primera descarga, cae a IEX
-    y se queda con IEX para no mezclar volúmenes de fuentes distintas."""
-    global _feed
+def rango_apertura(hoy):
+    """{simbolo: {'alto','bajo','n'}} con el máximo y mínimo de las velas de 1 min entre 9:30 y 9:45 NY."""
+    ini = datetime.combine(hoy, APERTURA, tzinfo=NY)
+    fin = datetime.combine(hoy, FIN_RANGO, tzinfo=NY)
     salida = {}
-    simbolos = list(simbolos)
-    for i in range(0, len(simbolos), lote):
-        trozo = simbolos[i:i + lote]
-        df = None
-        for intento in range(3):
-            for feed in ([_feed] if _feed else [DataFeed.SIP, DataFeed.IEX]):
-                try:
-                    req = StockBarsRequest(symbol_or_symbols=trozo, timeframe=timeframe, start=inicio, end=fin,
-                                           feed=feed, adjustment=Adjustment.SPLIT)
-                    df = data_client.get_stock_bars(req).df
-                    if _feed is None:
-                        _feed = feed
-                        log(f"ℹ️ Feed de datos: {feed}")
-                    break
-                except Exception as e:
-                    log(f"⚠️ Descarga ({feed}) falló: {str(e)[:120]}")
-            if df is not None:
-                break
-            time.sleep(5 * (intento + 1))
-        if df is None or df.empty:
+    try:
+        df = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=POOL, timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            start=ini, end=fin - timedelta(seconds=1), feed=FEED)).df
+    except Exception as e:
+        log(f"❌ No se pudieron descargar las velas del rango: {str(e)[:150]}")
+        return salida
+    if df is None or df.empty:
+        return salida
+    for sym, g in df.groupby(level="symbol"):
+        g = g.droplevel("symbol").sort_index()
+        g = g[(g.index >= ini) & (g.index < fin)]
+        if len(g) < MIN_VELAS_RANGO:
+            log(f"   ⚠️ {sym}: rango incompleto ({len(g)} de 15 velas), se descarta hoy")
             continue
-        for sym, g in df.groupby(level="symbol"):
-            g = g.droplevel("symbol").sort_index()
-            g.index = g.index.tz_convert(NY)
-            salida[sym] = g
-        time.sleep(0.5)
+        salida[sym] = {"alto": float(g["high"].max()), "bajo": float(g["low"].min()), "n": len(g)}
     return salida
 
 
-# ==========================================================
-# PREPARACIÓN
-# ==========================================================
-def true_range(df):
-    pc = df["close"].shift(1)
-    return pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()],
-                     axis=1).max(axis=1)
-
-
-def preparar_diaria(df):
-    """Valores del día ANTERIOR (shift 1) indexados por fecha: así no se usa información del propio día."""
-    d = df.copy()
-    atr = true_range(d).ewm(alpha=1 / ATR_P, adjust=False).mean()
-    vol_med = d["volume"].rolling(14).mean()
-    out = pd.DataFrame({"atr_prev": atr.shift(1), "vol_prev": vol_med.shift(1), "close_prev": d["close"].shift(1)})
-    out.index = d.index.date
-    return out[~out.index.duplicated(keep="last")]
-
-
-def preparar_5m(df):
-    d = df.copy()
-    d["minuto"] = d.index.hour * 60 + d.index.minute
-    d["fecha"] = d.index.date
-    return d[(d["minuto"] >= APERTURA_MIN) & (d["minuto"] < CIERRE_MIN)]
+def precios_actuales(simbolos):
+    """Último precio negociado de varios símbolos en una sola llamada. {} si falla."""
+    try:
+        t = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=list(simbolos), feed=FEED))
+        return {s: float(v.price) for s, v in t.items()}
+    except Exception as e:
+        log(f"   ⚠️ sin precios en tiempo real ({str(e)[:80]})")
+        return {}
 
 
 # ==========================================================
-# SIMULACIÓN DE UNA OPERACIÓN
+# ÓRDENES Y TAMAÑO
 # ==========================================================
-def simular_trade(op, hi, lo, cl, nivel_hi, nivel_lo, direccion, riesgo):
-    """Barras DESPUÉS de la vela de apertura. Devuelve (entrada, salida, tipo) o None si no hay ruptura.
-    Si la vela de entrada también toca el stop, se asume stop (criterio conservador).
-    Si una vela abre más allá del stop, se sale a la apertura (hueco)."""
-    entrada, stop = None, None
-    for i in range(len(op)):
-        if entrada is None:
-            if direccion == 1 and hi[i] >= nivel_hi:
-                entrada = max(nivel_hi, op[i])
-                stop = entrada - riesgo
-            elif direccion == -1 and lo[i] <= nivel_lo:
-                entrada = min(nivel_lo, op[i])
-                stop = entrada + riesgo
-            else:
+def calcular_cantidad(equity, exposicion, precio, riesgo):
+    q_riesgo = math.floor(equity * RIESGO_POR_OPERACION / riesgo)
+    q_pos = math.floor(equity * MAX_POSICION_PCT / precio)
+    q_exp = math.floor(max(0.0, equity * MAX_EXPOSICION - exposicion) / precio)
+    return min(q_riesgo, q_pos, q_exp), (q_riesgo, q_pos, q_exp)
+
+
+def ordenes_del_bot(dias=5):
+    inicio = ahora_ny() - timedelta(days=dias)
+    ords = trading_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, after=inicio, limit=500))
+    return [o for o in ords if (o.client_order_id or "").startswith(PREFIJO)]
+
+
+def dia_de_cierre_anticipado(hoy):
+    """True si hoy el mercado cierra antes de las 16:00 (el cierre del bot llegaría tarde)."""
+    try:
+        cal = trading_client.get_calendar(GetCalendarRequest(start=hoy, end=hoy))
+        return bool(cal) and cal[0].close.time() < dtime(16, 0)
+    except Exception as e:
+        log(f"⚠️ No se pudo consultar el calendario ({str(e)[:80]}); se continúa.")
+        return False
+
+
+# ==========================================================
+# MODO ENTRADA
+# ==========================================================
+def ejecutar_entrada():
+    hoy = ahora_ny().date()
+    fin_ventana = datetime.combine(hoy, ENTRADA_HASTA, tzinfo=NY)
+    if not DRY_RUN:
+        t = ahora_ny().time()
+        if ahora_ny().weekday() >= 5 or not (APERTURA <= t < ENTRADA_HASTA):
+            log(f"⏸️ Modo entrada: fuera de la franja {APERTURA:%H:%M}-{ENTRADA_HASTA:%H:%M} NY. No se hace nada.")
+            return
+        if not trading_client.get_clock().is_open:
+            log("⏸️ Mercado cerrado. No se hace nada.")
+            return
+        if dia_de_cierre_anticipado(hoy):
+            log("⏸️ Hoy el mercado cierra antes de las 16:00: no se entra.")
+            return
+
+    # 1) Esperar a que termine el rango (9:45) y calcularlo
+    if APERTURA <= ahora_ny().time() < FIN_RANGO:
+        log(f"⏳ Esperando a las {FIN_RANGO:%H:%M} NY para cerrar el rango de apertura...")
+        esperar_hasta(FIN_RANGO, 10)
+    rangos = rango_apertura(hoy)
+    if not rangos:
+        log("❌ No hay rango de apertura de hoy (¿festivo, fuera de horario o sin datos?).")
+        return
+
+    equity = float(trading_client.get_account().equity)
+    posiciones = {p.symbol: p for p in trading_client.get_all_positions()}
+    exposicion = sum(abs(float(p.market_value)) for p in posiciones.values())
+    historial = ordenes_del_bot()
+    de_hoy = {o.symbol for o in historial if o.created_at.astimezone(NY).date() == hoy}
+    previas = {o.symbol for o in historial if o.created_at.astimezone(NY).date() < hoy}
+    for s in sorted((previas & set(posiciones)) - de_hoy):
+        log(f"⚠️ {s}: sigue abierta una posición de un día anterior de este bot. Ciérrala a mano si no la quieres.")
+    log(f"💼 Equity ${equity:,.2f} | posiciones {len(posiciones)} | exposición {exposicion / equity:.0%} "
+        f"| feed {FEED.value}")
+
+    activos = {}
+    for s in POOL:
+        r = rangos.get(s)
+        if r is None:
+            continue
+        log(f"   📐 {s}: rango {r['bajo']:.2f} - {r['alto']:.2f} ({(r['alto'] - r['bajo']) / r['alto']:.2%})")
+        if s in posiciones:
+            log(f"   ⏭️ {s}: ya hay una posición abierta en la cuenta")
+        elif s in de_hoy:
+            log(f"   ⏭️ {s}: este bot ya operó hoy en este símbolo")
+        else:
+            activos[s] = r
+    n_pos = len(posiciones)
+
+    # 2) Vigilar la ruptura del máximo hasta ENTRADA_HASTA (en DRY_RUN fuera de horario: una sola pasada)
+    una_pasada = DRY_RUN and ahora_ny() >= fin_ventana
+    vueltas = 0
+    precios = {}
+    while activos and n_pos < MAX_POSICIONES and (una_pasada or ahora_ny() < fin_ventana):
+        precios = precios_actuales(activos)
+        for s in list(activos):
+            p, r = precios.get(s), activos[s]
+            if p is None or p <= r["alto"]:
                 continue
-            if direccion == 1 and lo[i] <= stop:
-                return entrada, stop, "SL"
-            if direccion == -1 and hi[i] >= stop:
-                return entrada, stop, "SL"
-            continue
-        if direccion == 1 and lo[i] <= stop:
-            return entrada, min(stop, op[i]), "SL"
-        if direccion == -1 and hi[i] >= stop:
-            return entrada, max(stop, op[i]), "SL"
-    if entrada is None:
-        return None
-    return entrada, float(cl[-1]), "EOD"
+            if p > r["alto"] * (1 + MAX_PERSECUCION_PCT):
+                log(f"   ⏭️ {s}: ruptura ya muy extendida ({p:.2f} vs máximo {r['alto']:.2f}); no se persigue")
+                del activos[s]
+                continue
+            stop = round(r["bajo"], 2)
+            riesgo = p - stop
+            if riesgo / p < RIESGO_MIN_PCT or riesgo / p > RIESGO_MAX_PCT:
+                log(f"   ⏭️ {s}: stop a {riesgo / p:.2%} del precio (fuera de {RIESGO_MIN_PCT:.1%}-{RIESGO_MAX_PCT:.0%})")
+                del activos[s]
+                continue
+            qty, det = calcular_cantidad(equity, exposicion, p, riesgo)
+            if qty < 1:
+                log(f"   ⚠️ {s}: tamaño < 1 acción (riesgo/posición/exposición: {det})")
+                del activos[s]
+                continue
+            log(f"🟢 RUPTURA {s}: precio {p:.2f} > máximo {r['alto']:.2f} | COMPRA {qty} acc a mercado "
+                f"| STOP {stop:.2f} ({riesgo / p:.2%}) | riesgo ${qty * riesgo:,.0f}")
+            oid = ""
+            if not DRY_RUN:
+                try:
+                    o = trading_client.submit_order(MarketOrderRequest(
+                        symbol=s, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                        order_class=OrderClass.OTO, stop_loss=StopLossRequest(stop_price=stop),
+                        client_order_id=f"{PREFIJO}{s}-{hoy:%Y%m%d}"))
+                    oid = str(o.id)
+                    time.sleep(3)
+                    o2 = trading_client.get_order_by_id(o.id)
+                    log(f"   ✅ Orden {oid[:8]}: {str(getattr(o2.status, 'value', o2.status))} "
+                        f"(precio medio {o2.filled_avg_price})")
+                except Exception as e:
+                    log(f"❌ Error enviando {s}: {e}")
+                    del activos[s]
+                    continue
+            registrar_csv({"evento": "entrada", "simbolo": s, "qty": qty, "orb_alto": r["alto"], "orb_bajo": r["bajo"],
+                           "precio": p, "stop": stop, "orden_id": oid})
+            exposicion += qty * p
+            n_pos += 1
+            del activos[s]
+            if n_pos >= MAX_POSICIONES:
+                break
+        if una_pasada:
+            break
+        vueltas += 1
+        if vueltas % 20 == 0 and activos:
+            log("👀 Vigilando: " + " | ".join(
+                f"{s} {precios.get(s, float('nan')):.2f}/{r['alto']:.2f}" for s, r in activos.items()))
+        time.sleep(POLL_SEG)
 
-
-def registros_simbolo(sym, d5, dd, vol_min):
-    """Una fila por (símbolo, día) que pasa el filtro de universo, con su RV, dirección y operación simulada."""
-    regs = []
-    grupos = {f: g for f, g in d5.groupby("fecha")}
-    primeras = {f: g.iloc[0] for f, g in grupos.items() if g["minuto"].iloc[0] == APERTURA_MIN}
-    if len(primeras) < RV_MIN_HIST + 2:
-        return regs
-    fechas = sorted(primeras)
-    vols = pd.Series([float(primeras[f]["volume"]) for f in fechas], index=fechas)
-    base = vols.shift(1).rolling(RV_VENTANA, min_periods=RV_MIN_HIST).mean()
-    rv = vols / base
-    for f in fechas:
-        if f not in dd.index or pd.isna(rv[f]) or base[f] <= 0:
-            continue
-        info = dd.loc[f]
-        if (pd.isna(info["atr_prev"]) or pd.isna(info["vol_prev"]) or pd.isna(info["close_prev"])
-                or info["close_prev"] < PRECIO_MIN or info["vol_prev"] < vol_min or info["atr_prev"] < ATR_MIN):
-            continue
-        v = primeras[f]
-        o, h, l, c = float(v["open"]), float(v["high"]), float(v["low"]), float(v["close"])
-        direccion = 1 if c > o else (-1 if c < o else 0)
-        trade = None
-        riesgo = SL_FRAC_ATR * float(info["atr_prev"])
-        if direccion != 0 and h > l and riesgo > 0:
-            g = grupos[f]
-            g = g[g["minuto"] >= APERTURA_MIN + 5]
-            if len(g) >= 3:
-                r = simular_trade(g["open"].values, g["high"].values, g["low"].values, g["close"].values,
-                                  h, l, direccion, riesgo)
-                if r:
-                    entrada, salida, tipo = r
-                    trade = {"rb": direccion * (salida - entrada) / riesgo, "k": entrada / riesgo, "tipo": tipo}
-        regs.append({"fecha": f, "sym": sym, "rv": float(rv[f]), "dir": direccion, "trade": trade})
-    return regs
-
-
-# ==========================================================
-# MÉTRICAS
-# ==========================================================
-def neto(t, c):
-    """R de la operación tras el coste c (ida y vuelta, en % del precio). k = precio / riesgo por acción."""
-    return t["rb"] - c * t["k"]
-
-
-def retorno_dia(trades, c):
-    """Retorno diario aproximado: riesgo 1 % por operación, exposición total limitada a APALANC_MAX."""
-    if not trades:
-        return 0.0
-    exposicion = RIESGO_OP * sum(t["k"] for t in trades)
-    escala = min(1.0, APALANC_MAX / exposicion) if exposicion > 0 else 1.0
-    return RIESGO_OP * escala * sum(neto(t, c) for t in trades)
-
-
-def curva(retornos):
-    eq = np.cumprod(1 + np.array(retornos, float))
-    dd = eq / np.maximum.accumulate(eq) - 1
-    return float(eq[-1] - 1), float(dd.min())
-
-
-def stats(rs):
-    rs = np.array(rs, float)
-    if len(rs) == 0:
-        return None
-    gan, per = rs[rs > 0].sum(), -rs[rs < 0].sum()
-    se = rs.std(ddof=1) / math.sqrt(len(rs)) if len(rs) > 1 else float("nan")
-    return {"n": len(rs), "acierto": float(np.mean(rs > 0)), "r": float(rs.mean()), "se": float(se),
-            "pf": float(gan / per) if per > 0 else float("inf")}
-
-
-def linea(nombre, st, ret=None, dd=None, extra=""):
-    if st is None:
-        return f"{nombre}: sin operaciones"
-    s = (f"{nombre}: n={st['n']} | acierto {st['acierto']:.0%} | R medio {st['r']:+.3f} (±{st['se']:.3f}) "
-         f"| profit factor {st['pf']:.2f}")
-    if ret is not None:
-        s += f" | retorno compuesto {ret:+.1%} | caída máx. {dd:.1%}"
-    return s + extra
+    if activos:
+        log("ℹ️ Sin ruptura (o sin entrada) en: " + ", ".join(activos) + ". Es normal: no se fuerza ninguna entrada.")
 
 
 # ==========================================================
-# BACKTEST
+# MODO CIERRE (solo lo de este bot, solo las órdenes de hoy)
 # ==========================================================
-def permitido(r):
-    return r["trade"] is not None and (DIRECCION != "largos" or r["dir"] == 1)
-
-
-def backtest():
-    rng = random.Random(42)
-    ahora = ahora_ny()
-    fin = ahora - timedelta(minutes=RETRASO_MIN)
-    log(f"⬇️ Descargando velas diarias y de 5 min de {len(POOL)} símbolos (puede tardar varios minutos)...")
-    diarias_raw = descargar_barras(POOL, TimeFrame(1, TimeFrameUnit.Day),
-                                   ahora - timedelta(days=int(BACKTEST_DIAS * 1.5) + 60), fin)
-    raw5 = descargar_barras(list(diarias_raw), TimeFrame(5, TimeFrameUnit.Minute),
-                            ahora - timedelta(days=int(BACKTEST_DIAS * 1.5) + 30), fin)
-    if not raw5:
-        log("❌ Sin datos suficientes.")
+def ejecutar_cierre():
+    if fuera_de_franja(CIERRE_PERMITIDO, "cierre"):
         return
-    vol_min = VOL_MEDIO_MIN if _feed == DataFeed.SIP else 0
-    if vol_min == 0:
-        log("⚠️ Datos IEX: los volúmenes son solo una fracción del total, se desactiva el filtro de volumen medio.")
-
-    regs = []
-    for s, df in raw5.items():
-        if s in diarias_raw and len(diarias_raw[s]) > 30:
-            regs += registros_simbolo(s, preparar_5m(df), preparar_diaria(diarias_raw[s]), vol_min)
-    if not regs:
-        log("❌ Ningún símbolo/día pasó los filtros.")
+    hoy = ahora_ny().date()
+    syms = sorted({o.symbol for o in ordenes_del_bot() if o.created_at.astimezone(NY).date() == hoy})
+    if not syms:
+        log("ℹ️ El bot no abrió operaciones hoy. Nada que cerrar.")
         return
-
-    ref = max(raw5, key=lambda s: len(raw5[s]))
-    dref = preparar_5m(raw5[ref])
-    hoy = ahora.date()
-    dias = sorted({f for f in dref[dref["minuto"] == APERTURA_MIN]["fecha"] if f < hoy})[-BACKTEST_DIAS:]
-    por_fecha = defaultdict(list)
-    for r in regs:
-        por_fecha[r["fecha"]].append(r)
-    log(f"▶️ Backtest sobre {len(dias)} sesiones ({dias[0]} → {dias[-1]}), {len(raw5)} símbolos, "
-        f"direcciones: {DIRECCION}, coste {COSTE_PCT:.2%}")
-
-    sel_trades, filas_csv, dias_con_sel = [], [], 0
-    est_diario = []                       # lista de listas de operaciones por día (estrategia)
-    az_trades = [[] for _ in range(REPS_ALEATORIO)]
-    az_diario = [[] for _ in range(REPS_ALEATORIO)]
-    for D in dias:
-        univ = por_fecha.get(D, [])
-        sel = sorted([r for r in univ if r["rv"] >= RV_MIN], key=lambda r: r["rv"], reverse=True)[:N_TOP]
-        if not sel:
-            est_diario.append([])
-            for k in range(REPS_ALEATORIO):
-                az_diario[k].append([])
+    posiciones = {p.symbol: p for p in trading_client.get_all_positions()}
+    objetivo = [s for s in syms if s in posiciones]
+    if not objetivo:
+        log(f"ℹ️ Las operaciones de hoy ({', '.join(syms)}) ya no tienen posición abierta (stop ejecutado). Nada que cerrar.")
+        return
+    log(f"🔔 Cierre de fin de día para: {', '.join(objetivo)}")
+    abiertas = list(trading_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=objetivo, limit=500)))
+    for o in abiertas:
+        log(f"   cancelando orden abierta {o.symbol} ({str(getattr(o.order_type, 'value', o.order_type))})")
+        if not DRY_RUN:
+            try:
+                trading_client.cancel_order_by_id(o.id)
+            except Exception as e:
+                log(f"   ⚠️ {e}")
+    if not DRY_RUN and abiertas:
+        time.sleep(3)
+    for s in objetivo:
+        p = posiciones[s]
+        pnl = float(p.unrealized_pl)
+        log(f"🔴 Cerrando {s}: {p.qty} acc | entrada {float(p.avg_entry_price):.2f} | precio {float(p.current_price):.2f} "
+            f"| P&L {pnl:+,.2f}")
+        registrar_csv({"evento": "cierre", "simbolo": s, "qty": p.qty, "precio": p.current_price, "pnl": pnl})
+        if DRY_RUN:
             continue
-        dias_con_sel += 1
-        tr = [r for r in sel if permitido(r)]
-        est_diario.append([r["trade"] for r in tr])
-        for r in tr:
-            sel_trades.append(r)
-            filas_csv.append({"fecha": D, "simbolo": r["sym"], "rv": round(r["rv"], 2),
-                              "direccion": "largo" if r["dir"] == 1 else "corto",
-                              "R_bruto": round(r["trade"]["rb"], 3),
-                              "R_neto": round(neto(r["trade"], COSTE_PCT), 3), "salida": r["trade"]["tipo"]})
-        # Línea base: mismo nº de símbolos, elegidos al azar en el universo líquido del día
-        for k in range(REPS_ALEATORIO):
-            muestra = rng.sample(univ, min(len(sel), len(univ)))
-            tr_az = [r["trade"] for r in muestra if permitido(r)]
-            az_diario[k].append(tr_az)
-            az_trades[k] += tr_az
-
-    if not sel_trades:
-        log("❌ La estrategia no generó operaciones en este periodo.")
-        return
-
-    c = COSTE_PCT
-    r_est = [neto(r["trade"], c) for r in sel_trades]
-    r_az = [neto(t, c) for lst in az_trades for t in lst]
-    st_e, st_a = stats(r_est), stats(r_az)
-    ret_e, dd_e = curva([retorno_dia(d, c) for d in est_diario])
-    rets_az = [curva([retorno_dia(d, c) for d in az_diario[k]]) for k in range(REPS_ALEATORIO)]
-    ret_a = float(np.mean([x[0] for x in rets_az]))
-    dd_a = float(np.mean([x[1] for x in rets_az]))
-
-    print("\n" + "=" * 86)
-    print(linea("ESTRATEGIA (top RV) ", st_e, ret_e, dd_e))
-    print(linea("AL AZAR (mismo n)   ", st_a, ret_a, dd_a, f" (media de {REPS_ALEATORIO} repeticiones)"))
-    print("=" * 86)
-    print(f"Días con al menos un 'stock in play': {dias_con_sel} de {len(dias)} | "
-          f"operaciones por día (media): {len(sel_trades) / max(dias_con_sel, 1):.1f}")
-
-    print("\nSensibilidad al coste ida y vuelta (R medio por operación):")
-    print("  coste     estrategia      al azar")
-    for cc in COSTES_SENSIBILIDAD:
-        e = np.mean([neto(r["trade"], cc) for r in sel_trades])
-        a = np.mean([neto(t, cc) for lst in az_trades for t in lst])
-        print(f"  {cc:.2%}   {e:+9.3f}   {a:+9.3f}")
-
-    if DIRECCION != "largos":
-        print("\nDesglose de la estrategia (con el coste indicado):")
-        for nombre, d in (("largos", 1), ("cortos", -1)):
-            sub = [neto(r["trade"], c) for r in sel_trades if r["dir"] == d]
-            print("  " + linea(nombre, stats(sub)))
-
-    se_dif = math.sqrt(st_e["se"] ** 2 + (st_a["se"] if st_a else 0.0) ** 2)
-    dif = st_e["r"] - (st_a["r"] if st_a else 0.0)
-    print(f"\nDiferencia de R medio frente al azar: {dif:+.3f} (±{se_dif:.3f})")
-    if st_e["r"] <= 0:
-        print("⚠️ El R medio es <= 0: tras costes NO hay beneficio en este periodo.")
-    if dif <= 0:
-        print("⚠️ No supera a elegir al azar en el mismo universo: el filtro de volumen relativo no aporta aquí.")
-    elif abs(dif) < 2 * se_dif:
-        print("ℹ️ Supera al azar, pero la diferencia está dentro del ruido estadístico (menos de 2 errores estándar).")
-    else:
-        print("ℹ️ Supera al azar de forma estadísticamente apreciable en este periodo. Valida con otro periodo.")
-    if st_e["n"] < 100:
-        print("ℹ️ Menos de 100 operaciones: resultado poco concluyente.")
-    print("Notas: entrada con orden stop en el extremo de la vela de 9:30 (si hay hueco, a la apertura de la vela); "
-          "stop = 10 % del ATR diario; salida al cierre. Si la vela de entrada toca también el stop, se asume stop. "
-          "Las operaciones de un mismo día están correlacionadas, así que los errores estándar son optimistas. "
-          "El retorno compuesto es aproximado (exposición máxima 4x, sin comisiones por acción, sin costes de préstamo en cortos).")
-
-    pd.DataFrame(filas_csv).to_csv(CSV_DETALLE, index=False)
-    print(f"Detalle guardado en {CSV_DETALLE}")
+        for intento in range(2):
+            try:
+                trading_client.close_position(s)
+                break
+            except Exception as e:
+                log(f"❌ Error cerrando {s} (intento {intento + 1}): {e}")
+                time.sleep(3)
 
 
 # ==========================================================
 # MAIN
 # ==========================================================
+def main(modo):
+    if modo not in ("entrada", "cierre"):
+        print("Uso: python bot_orb.py entrada | cierre")
+        return 1
+    if not iniciar_clientes():
+        return 1
+    log("🧪 DRY_RUN: se simula, NO se envían órdenes" if DRY_RUN else "🚀 PAPER: se envían órdenes a la cuenta paper")
+    if modo == "entrada":
+        ejecutar_entrada()
+    else:
+        ejecutar_cierre()
+    return 0
+
+
 if __name__ == "__main__":
-    modo = sys.argv[1] if len(sys.argv) > 1 else "backtest"
-    if modo != "backtest":
-        print("Por ahora solo existe el modo 'backtest':  python bot_orb.py backtest")
-        sys.exit(1)
-    if iniciar_clientes():
-        backtest()
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else ""))
