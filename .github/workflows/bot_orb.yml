@@ -1,32 +1,35 @@
-name: Bot ORB backtest
+name: Bot ORB
 
 on:
+  schedule:
+    # Entrada: el rango de apertura termina a las 9:45 NY. Se lanza un poco antes (9:43) y con un respaldo 15 min despues.
+    - cron: "43 13 * * 1-5"   # entrada, horario de verano EE. UU.
+    - cron: "58 13 * * 1-5"   # entrada (respaldo), horario de verano
+    - cron: "43 14 * * 1-5"   # entrada, horario de invierno
+    - cron: "58 14 * * 1-5"   # entrada (respaldo), horario de invierno
+    # Cierre: objetivo 15:35 y 15:50 NY
+    - cron: "35 19 * * 1-5"   # cierre, horario de verano
+    - cron: "50 19 * * 1-5"   # cierre (respaldo), horario de verano
+    - cron: "35 20 * * 1-5"   # cierre, horario de invierno
+    - cron: "50 20 * * 1-5"   # cierre (respaldo), horario de invierno
   workflow_dispatch:
     inputs:
-      dias:
-        description: "Sesiones del backtest"
-        type: string
-        default: "250"
-      coste:
-        description: "Coste ida y vuelta en fracción del precio (0.0010 = 0,10 %)"
-        type: string
-        default: "0.0010"
-      direccion:
-        description: "Direcciones a operar"
+      modo:
+        description: "Modo a ejecutar"
         type: choice
         options:
-          - ambos
-          - largos
-        default: ambos
+          - entrada
+          - cierre
+        default: entrada
 
 concurrency:
   group: bot-orb
   cancel-in-progress: false
 
 jobs:
-  backtest:
+  bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - name: Descargar el repositorio
         uses: actions/checkout@v4
@@ -37,34 +40,48 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install alpaca-py pandas numpy
+        run: pip install alpaca-py pandas
 
-      - name: Ejecutar el backtest
+      - name: Ejecutar el bot
         shell: bash
         env:
           API_KEY_ORB: ${{ secrets.API_KEY_ORB }}
           SECRET_KEY_ORB: ${{ secrets.SECRET_KEY_ORB }}
-          BACKTEST_DIAS: ${{ inputs.dias }}
-          COSTE_PCT: ${{ inputs.coste }}
-          DIRECCION: ${{ inputs.direccion }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
+          EVENTO: ${{ github.event_name }}
+          PROGRAMACION: ${{ github.event.schedule }}
+          MODO_MANUAL: ${{ inputs.modo }}
         run: |
-          echo "Sesiones: $BACKTEST_DIAS | Coste: $COSTE_PCT | Direccion: $DIRECCION"
-          python bot_orb.py backtest 2>&1 | tee resumen_orb.txt
-
-      - name: Mostrar resumen en la pagina de la ejecucion
-        if: always()
-        shell: bash
-        run: |
-          if [ -f resumen_orb.txt ]; then
-            { echo '```'; cat resumen_orb.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EVENTO" = "workflow_dispatch" ]; then
+            MODO="$MODO_MANUAL"
+          else
+            case "$PROGRAMACION" in
+              "43 13 * * 1-5"|"58 13 * * 1-5"|"43 14 * * 1-5"|"58 14 * * 1-5") MODO="entrada" ;;
+              "35 19 * * 1-5"|"50 19 * * 1-5"|"35 20 * * 1-5"|"50 20 * * 1-5") MODO="cierre" ;;
+              *) echo "Programacion desconocida: $PROGRAMACION"; exit 1 ;;
+            esac
           fi
 
-      - name: Guardar resultados
+          # Hora real en Nueva York (minutos desde medianoche). Una ejecucion programada solo actua si cae dentro
+          # de su franja: entrada 9:30-10:45 NY, cierre 15:25-15:59 NY. Asi los crons de la otra estacion no hacen nada.
+          HORA_NY=$(TZ=America/New_York date +%H:%M)
+          MIN_NY=$(( 10#$(TZ=America/New_York date +%H) * 60 + 10#$(TZ=America/New_York date +%M) ))
+          if [ "$EVENTO" = "schedule" ]; then
+            if [ "$MODO" = "entrada" ] && { [ "$MIN_NY" -lt 570 ] || [ "$MIN_NY" -gt 645 ]; }; then
+              echo "Fuera de la franja de entrada (9:30-10:45 NY); son las $HORA_NY. Salgo."; exit 0
+            fi
+            if [ "$MODO" = "cierre" ] && { [ "$MIN_NY" -lt 925 ] || [ "$MIN_NY" -gt 959 ]; }; then
+              echo "Fuera de la franja de cierre (15:25-15:59 NY); son las $HORA_NY. Salgo."; exit 0
+            fi
+          fi
+
+          echo "Modo: $MODO | Hora NY: $HORA_NY | DRY_RUN=$DRY_RUN"
+          python -u bot_orb.py "$MODO"
+
+      - name: Guardar registros
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: resultados-orb-${{ github.run_id }}
-          path: |
-            resumen_orb.txt
-            backtest_orb.csv
+          name: registros-orb-${{ github.run_id }}
+          path: registro_orb.csv
           if-no-files-found: ignore
