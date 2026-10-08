@@ -12,6 +12,11 @@ on:
     - cron: "50 19 * * 1-5"   # cierre (respaldo), horario de verano
     - cron: "35 20 * * 1-5"   # cierre, horario de invierno
     - cron: "50 20 * * 1-5"   # cierre (respaldo), horario de invierno
+    # Sombra: tras el cierre del mercado (16:25 y 16:55 NY). Reproduce el dia y anota variantes, sin ordenes.
+    - cron: "25 20 * * 1-5"   # sombra, horario de verano
+    - cron: "55 20 * * 1-5"   # sombra (respaldo), horario de verano
+    - cron: "25 21 * * 1-5"   # sombra, horario de invierno
+    - cron: "55 21 * * 1-5"   # sombra (respaldo), horario de invierno
   workflow_dispatch:
     inputs:
       modo:
@@ -20,7 +25,17 @@ on:
         options:
           - entrada
           - cierre
+          - sombra
+          - resumen
         default: entrada
+      fecha:
+        description: "Solo para sombra: dia a reproducir (AAAA-MM-DD). Vacio = hoy"
+        type: string
+        default: ""
+
+# Necesario para que el workflow pueda guardar la carpeta datos/ en el repositorio
+permissions:
+  contents: write
 
 concurrency:
   group: bot-orb
@@ -51,6 +66,7 @@ jobs:
           EVENTO: ${{ github.event_name }}
           PROGRAMACION: ${{ github.event.schedule }}
           MODO_MANUAL: ${{ inputs.modo }}
+          FECHA_SOMBRA: ${{ inputs.fecha }}
         run: |
           if [ "$EVENTO" = "workflow_dispatch" ]; then
             MODO="$MODO_MANUAL"
@@ -58,12 +74,14 @@ jobs:
             case "$PROGRAMACION" in
               "43 13 * * 1-5"|"58 13 * * 1-5"|"43 14 * * 1-5"|"58 14 * * 1-5") MODO="entrada" ;;
               "35 19 * * 1-5"|"50 19 * * 1-5"|"35 20 * * 1-5"|"50 20 * * 1-5") MODO="cierre" ;;
+              "25 20 * * 1-5"|"55 20 * * 1-5"|"25 21 * * 1-5"|"55 21 * * 1-5") MODO="sombra" ;;
               *) echo "Programacion desconocida: $PROGRAMACION"; exit 1 ;;
             esac
           fi
 
           # Hora real en Nueva York (minutos desde medianoche). Una ejecucion programada solo actua si cae dentro
-          # de su franja: entrada 9:30-10:45 NY, cierre 15:25-15:59 NY. Asi los crons de la otra estacion no hacen nada.
+          # de su franja: entrada 9:30-10:45, cierre 15:25-15:59, sombra 16:10-17:30 (hora de NY).
+          # Asi los crons de la otra estacion no hacen nada.
           HORA_NY=$(TZ=America/New_York date +%H:%M)
           MIN_NY=$(( 10#$(TZ=America/New_York date +%H) * 60 + 10#$(TZ=America/New_York date +%M) ))
           if [ "$EVENTO" = "schedule" ]; then
@@ -73,15 +91,41 @@ jobs:
             if [ "$MODO" = "cierre" ] && { [ "$MIN_NY" -lt 925 ] || [ "$MIN_NY" -gt 959 ]; }; then
               echo "Fuera de la franja de cierre (15:25-15:59 NY); son las $HORA_NY. Salgo."; exit 0
             fi
+            if [ "$MODO" = "sombra" ] && { [ "$MIN_NY" -lt 970 ] || [ "$MIN_NY" -gt 1050 ]; }; then
+              echo "Fuera de la franja de sombra (16:10-17:30 NY); son las $HORA_NY. Salgo."; exit 0
+            fi
           fi
 
           echo "Modo: $MODO | Hora NY: $HORA_NY | DRY_RUN=$DRY_RUN"
-          python -u bot_orb.py "$MODO"
+          python -u bot_orb.py "$MODO" 2>&1 | tee salida_orb.txt
 
-      - name: Guardar registros
+      - name: Mostrar el log en la pagina de la ejecucion
+        if: always()
+        shell: bash
+        run: |
+          if [ -f salida_orb.txt ]; then
+            { echo '```'; cat salida_orb.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Guardar datos en el repositorio
+        if: always()
+        shell: bash
+        run: |
+          if [ -d datos ] && [ -n "$(git status --porcelain datos)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add datos
+            git commit -m "datos ORB $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push || echo "No se pudo guardar en el repositorio: revisa Settings > Actions > General > Workflow permissions (Read and write)."
+          fi
+
+      - name: Guardar registros como artefacto
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: registros-orb-${{ github.run_id }}
-          path: registro_orb.csv
+          path: |
+            datos/*.csv
+            salida_orb.txt
           if-no-files-found: ignore
