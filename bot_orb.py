@@ -16,7 +16,14 @@ Cómo funciona (importante)
   hasta ENTRADA_HASTA (11:00 NY): espera a las 9:45, calcula el rango y vigila el precio cada POLL_SEG
   segundos; en cuanto un símbolo supera su máximo envía la compra a mercado con el stop adjunto.
 
-Modos:   python bot_orb.py entrada | cierre
+Modos:   python bot_orb.py entrada | cierre | sombra | resumen
+  entrada  -> espera el rango, vigila la ruptura y compra (hasta ENTRADA_HASTA).
+  cierre   -> cancela el stop y cierra las posiciones abiertas hoy por este bot.
+  sombra   -> tras el cierre del mercado, reproduce la sesión con velas de 1 min y anota en datos/sombra_orb.csv
+              qué habrían hecho varias variantes (confirmar con vela de 5 min, stop medio, break-even, trailing).
+              NO envía órdenes: sirve para comparar ideas con datos reales sin tocar la operativa.
+              Opcional: FECHA_SOMBRA=AAAA-MM-DD (o segundo argumento) para un día concreto que se haya perdido.
+  resumen  -> estadísticas acumuladas de datos/sombra_orb.csv.
 Credenciales (claves de PAPER): API_KEY_ORB / SECRET_KEY_ORB (o APCA_API_KEY_ID / APCA_API_SECRET_KEY).
 DRY_RUN: solo es False si la variable de entorno DRY_RUN vale false/0/no.
 FEED_DATOS: "iex" (por defecto, gratis y en tiempo real, aunque solo recoge operaciones de IEX) o "sip" (plan de pago).
@@ -29,6 +36,8 @@ import sys
 import csv
 import math
 import time
+
+import numpy as np
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -49,7 +58,9 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in ("false", "0"
 FEED = DataFeed.SIP if os.environ.get("FEED_DATOS", "iex").strip().lower() == "sip" else DataFeed.IEX
 NY = ZoneInfo("America/New_York")
 PREFIJO = "orb-"                   # prefijo de client_order_id: el cierre solo toca lo de este bot
-LOG_CSV = "registro_orb.csv"
+DIR_DATOS = "datos"                # carpeta que el workflow guarda en el repositorio
+LOG_CSV = f"{DIR_DATOS}/registro_orb.csv"
+SOMBRA_CSV = f"{DIR_DATOS}/sombra_orb.csv"
 
 # Universo (orb.txt recomienda NVDA, TSLA, AAPL/MSFT y QQQ)
 POOL = ["AAPL", "NVDA", "TSLA", "QQQ"]
@@ -90,6 +101,7 @@ def log(msg):
 
 
 def registrar_csv(fila):
+    os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
     nuevo = not os.path.exists(LOG_CSV)
     fila = {"timestamp": ahora_ny().isoformat(timespec="seconds"), "modo": "DRY_RUN" if DRY_RUN else "PAPER", **fila}
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
@@ -378,14 +390,285 @@ def ejecutar_cierre():
 
 
 # ==========================================================
+# MODO SOMBRA: reproduce la sesión con velas de 1 min y anota qué habrían hecho varias variantes
+# ==========================================================
+APERTURA_MIN = 9 * 60 + 30
+FIN_RANGO_MIN = 9 * 60 + 45
+ENTRADA_HASTA_MIN = ENTRADA_HASTA.hour * 60 + ENTRADA_HASTA.minute
+SALIDA_SOMBRA_MIN = 15 * 60 + 50   # las variantes salen al cierre de la última vela anterior a las 15:50
+COSTES_RESUMEN = (0.0005, 0.0010)  # coste ida y vuelta (0,05 % y 0,10 %) para el resumen
+
+# (nombre, tipo de entrada, stop inicial, gestión de la salida)
+VARIANTES = [
+    ("BASE", "ruptura", "rango", None),            # lo que hace el bot real
+    ("CONF5", "cierre5m", "rango", None),          # espera a que una vela de 5 min CIERRE sobre el máximo
+    ("STOP_MEDIO", "ruptura", "medio", None),      # stop en el punto medio del rango en lugar de en el mínimo
+    ("BE_1R", "ruptura", "rango", "BE"),           # stop a break-even cuando el precio avanza 1R
+    ("TRAIL_1R", "ruptura", "rango", "TRAIL"),     # trailing stop a 1R del máximo alcanzado
+]
+CAMPOS_SOMBRA = ["fecha", "simbolo", "variante", "hora_entrada", "entrada", "stop", "salida", "tipo_salida",
+                 "R_bruto", "k", "ret_pct", "rango_pct", "qqq_sobre_rango"]
+
+
+def velas_dia(fecha):
+    """{simbolo: DataFrame de velas de 1 min (hora NY) de la sesión regular de `fecha`}."""
+    ini = datetime.combine(fecha, APERTURA, tzinfo=NY)
+    fin = datetime.combine(fecha, dtime(16, 0), tzinfo=NY)
+    salida = {}
+    try:
+        df = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=POOL, timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            start=ini, end=fin - timedelta(seconds=1), feed=FEED)).df
+    except Exception as e:
+        log(f"❌ No se pudieron descargar las velas de {fecha}: {str(e)[:150]}")
+        return salida
+    if df is None or df.empty:
+        return salida
+    for sym, g in df.groupby(level="symbol"):
+        g = g.droplevel("symbol").sort_index()
+        g.index = g.index.tz_convert(NY)
+        salida[sym] = g[(g.index >= ini) & (g.index < fin)]
+    return salida
+
+
+def _arrays(g):
+    m = (g.index.hour * 60 + g.index.minute).to_numpy()
+    return (m, g["open"].to_numpy(float), g["high"].to_numpy(float),
+            g["low"].to_numpy(float), g["close"].to_numpy(float))
+
+
+def _entrada_ruptura(m, o, h, alto, hasta):
+    """Primera vela (desde las 9:45 y antes de `hasta`) cuyo máximo supera el máximo del rango."""
+    for i in range(len(m)):
+        if m[i] < FIN_RANGO_MIN:
+            continue
+        if m[i] >= hasta:
+            return None
+        if h[i] > alto:
+            return i, max(alto, float(o[i])), i
+    return None
+
+
+def _entrada_cierre5m(m, c, alto, hasta):
+    """Primera vela de 5 min (alineada desde las 9:45) que CIERRA por encima del máximo del rango."""
+    n = len(m)
+    for i in range(n):
+        if m[i] < FIN_RANGO_MIN:
+            continue
+        if m[i] >= hasta:
+            return None
+        g = (m[i] - FIN_RANGO_MIN) // 5
+        fin_grupo = i + 1 >= n or (m[i + 1] - FIN_RANGO_MIN) // 5 != g
+        if fin_grupo and c[i] > alto:
+            return i, float(c[i]), i + 1
+    return None
+
+
+def _gestionar_salida(o, h, l, c, desde, i_ent, entrada, stop0, riesgo, modo):
+    """Recorre las velas desde `desde` y devuelve (precio de salida, tipo). Si una vela toca el stop, sale por el stop
+    (o por la apertura si hay hueco por debajo). Dentro de una vela, el stop se comprueba antes de mover el stop."""
+    stop, maxh = stop0, entrada
+    for j in range(desde, len(o)):
+        if l[j] <= stop:
+            precio = stop if j == i_ent else min(stop, float(o[j]))
+            return precio, ("SL" if stop == stop0 else modo)
+        maxh = max(maxh, float(h[j]))
+        if modo == "BE" and h[j] >= entrada + riesgo:
+            stop = max(stop, entrada)
+        elif modo == "TRAIL":
+            stop = max(stop, maxh - riesgo)
+    return float(c[-1]), "EOD"
+
+
+def _info_qqq(g):
+    if g is None:
+        return None
+    m, o, h, l, c = _arrays(g)
+    pre = (m >= APERTURA_MIN) & (m < FIN_RANGO_MIN)
+    if pre.sum() < MIN_VELAS_RANGO:
+        return None
+    return m, c, float(h[pre].max())
+
+
+def _qqq_sobre(info, minuto):
+    if info is None:
+        return ""
+    qm, qc, qalto = info
+    k = int(np.searchsorted(qm, minuto, side="right")) - 1
+    return "" if k < 0 else bool(qc[k] > qalto)
+
+
+def simular_sombra(sym, g, info_qqq, fecha):
+    """Filas (una por variante) con lo que habría pasado hoy con este símbolo."""
+    m, o, h, l, c = _arrays(g)
+    pre = (m >= APERTURA_MIN) & (m < FIN_RANGO_MIN)
+    if pre.sum() < MIN_VELAS_RANGO:
+        return []
+    alto, bajo = float(h[pre].max()), float(l[pre].min())
+    sel = m < SALIDA_SOMBRA_MIN
+    m, o, h, l, c = m[sel], o[sel], h[sel], l[sel], c[sel]
+    entradas = {"ruptura": _entrada_ruptura(m, o, h, alto, ENTRADA_HASTA_MIN),
+                "cierre5m": _entrada_cierre5m(m, c, alto, ENTRADA_HASTA_MIN)}
+    filas = []
+    for nombre, tipo_ent, tipo_stop, modo in VARIANTES:
+        fila = {"fecha": fecha.isoformat(), "simbolo": sym, "variante": nombre,
+                "rango_pct": round((alto - bajo) / alto * 100, 3)}
+        ent = entradas[tipo_ent]
+        if ent is None:
+            fila["tipo_salida"] = "sin_entrada"
+            filas.append(fila)
+            continue
+        i, precio, desde = ent
+        if precio > alto * (1 + MAX_PERSECUCION_PCT):
+            fila["tipo_salida"] = "extendida"
+            filas.append(fila)
+            continue
+        stop0 = bajo if tipo_stop == "rango" else round((alto + bajo) / 2, 2)
+        riesgo = precio - stop0
+        if riesgo / precio < RIESGO_MIN_PCT or riesgo / precio > RIESGO_MAX_PCT:
+            fila["tipo_salida"] = "filtrado_riesgo"
+            filas.append(fila)
+            continue
+        salida, tipo = _gestionar_salida(o, h, l, c, desde, i, precio, stop0, riesgo, modo)
+        minuto_ent = int(m[i]) + (1 if tipo_ent == "cierre5m" else 0)
+        fila.update({"hora_entrada": f"{minuto_ent // 60:02d}:{minuto_ent % 60:02d}", "entrada": round(precio, 2),
+                     "stop": round(stop0, 2), "salida": round(salida, 2), "tipo_salida": tipo,
+                     "R_bruto": round((salida - precio) / riesgo, 4), "k": round(precio / riesgo, 3),
+                     "ret_pct": round((salida / precio - 1) * 100, 4),
+                     "qqq_sobre_rango": _qqq_sobre(info_qqq, minuto_ent)})
+        filas.append(fila)
+    return filas
+
+
+def fecha_procesada(fecha):
+    if not os.path.exists(SOMBRA_CSV):
+        return False
+    with open(SOMBRA_CSV, newline="", encoding="utf-8") as f:
+        return any(r.get("fecha") == fecha.isoformat() for r in csv.DictReader(f))
+
+
+def escribir_sombra(filas):
+    os.makedirs(os.path.dirname(SOMBRA_CSV), exist_ok=True)
+    nuevo = not os.path.exists(SOMBRA_CSV)
+    with open(SOMBRA_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CAMPOS_SOMBRA, restval="", extrasaction="ignore")
+        if nuevo:
+            w.writeheader()
+        w.writerows(filas)
+
+
+def ejecutar_sombra():
+    txt = os.environ.get("FECHA_SOMBRA", "").strip() or (sys.argv[2] if len(sys.argv) > 2 else "")
+    fecha = datetime.strptime(txt, "%Y-%m-%d").date() if txt else ahora_ny().date()
+    if fecha.weekday() >= 5:
+        log(f"⏸️ {fecha} es fin de semana. Nada que reproducir.")
+        return
+    if fecha == ahora_ny().date() and ahora_ny().time() < dtime(16, 5):
+        log("⏸️ La sesión de hoy aún no ha terminado. Nada que reproducir.")
+        return
+    if fecha_procesada(fecha):
+        log(f"ℹ️ {fecha} ya está en {SOMBRA_CSV}. No se repite.")
+        return
+    velas = velas_dia(fecha)
+    if not velas:
+        log(f"❌ Sin velas de {fecha} (¿festivo o sin datos?).")
+        return
+    info_qqq = _info_qqq(velas.get("QQQ"))
+    filas = []
+    log(f"👻 Reproduciendo la sesión del {fecha} (velas de 1 min, feed {FEED.value})")
+    for sym in POOL:
+        if sym not in velas:
+            continue
+        rs = simular_sombra(sym, velas[sym], info_qqq, fecha)
+        for r in rs:
+            if r.get("R_bruto") not in (None, ""):
+                log(f"   {sym:5s} {r['variante']:10s} {r['hora_entrada']} entra {r['entrada']:.2f} | stop {r['stop']:.2f} "
+                    f"-> sale {r['salida']:.2f} ({r['tipo_salida']}) | R {r['R_bruto']:+.2f}")
+            else:
+                log(f"   {sym:5s} {r['variante']:10s} {r['tipo_salida']}")
+        filas += rs
+    if not filas:
+        log("❌ Ningún símbolo tenía rango de apertura válido ese día.")
+        return
+    escribir_sombra(filas)
+    log(f"💾 {len(filas)} filas añadidas a {SOMBRA_CSV}")
+    resumen_sombra()
+
+
+def resumen_sombra():
+    import pandas as pd
+    if not os.path.exists(SOMBRA_CSV):
+        log("ℹ️ Todavía no hay datos de sombra.")
+        return
+    df = pd.read_csv(SOMBRA_CSV)
+    dias = df["fecha"].nunique()
+    t = df[df["R_bruto"].notna()].copy()
+    print("\n" + "=" * 92)
+    print(f"RESUMEN SOMBRA: {dias} sesiones | R = ganancia en múltiplos del riesgo | costes: ida y vuelta, % del precio")
+    print("=" * 92)
+    if t.empty:
+        print("Todavía no hay operaciones simuladas.")
+        return
+    c1, c2 = COSTES_RESUMEN
+    print(f"{'variante':11s}{'n':>5s}{'acierto':>9s}{'R bruto':>9s}{f'R {c1:.2%}':>10s}{f'R {c2:.2%}':>10s}"
+          f"{f'ret% {c1:.2%}':>13s}{'PF':>7s}")
+    for v, _, _, _ in VARIANTES:
+        s = t[t["variante"] == v]
+        if s.empty:
+            print(f"{v:11s}{0:>5d}  sin operaciones")
+            continue
+        r1 = s["R_bruto"] - c1 * s["k"]
+        r2 = s["R_bruto"] - c2 * s["k"]
+        gan, per = r1[r1 > 0].sum(), -r1[r1 < 0].sum()
+        pf = gan / per if per > 0 else float("inf")
+        ret = (s["ret_pct"] - c1 * 100).mean()
+        print(f"{v:11s}{len(s):>5d}{(r1 > 0).mean():>9.0%}{s['R_bruto'].mean():>+9.3f}{r1.mean():>+10.3f}"
+              f"{r2.mean():>+10.3f}{ret:>+12.3f}%{pf:>7.2f}")
+    base = t[t["variante"] == "BASE"].set_index(["fecha", "simbolo"])
+    print(f"\nDiferencia frente a BASE en los mismos símbolo-día (R tras coste {c1:.2%}; ± = error estándar):")
+    for v, _, _, _ in VARIANTES[1:]:
+        s = t[t["variante"] == v].set_index(["fecha", "simbolo"])
+        comunes = base.index.intersection(s.index)
+        if len(comunes) < 2:
+            print(f"  {v:11s} pocos pares todavía ({len(comunes)})")
+            continue
+        d = (s.loc[comunes, "R_bruto"] - c1 * s.loc[comunes, "k"]) - (base.loc[comunes, "R_bruto"] - c1 * base.loc[comunes, "k"])
+        se = d.std(ddof=1) / math.sqrt(len(d))
+        solo_base = len(base.index.difference(s.index))
+        print(f"  {v:11s} {d.mean():+.3f} (±{se:.3f}) sobre {len(d)} pares | operaciones de BASE que esta variante no hizo: {solo_base}")
+    b = t[t["variante"] == "BASE"].copy()
+    b["flag"] = b["qqq_sobre_rango"].astype(str)
+    print(f"\nBASE según si QQQ estaba por encima de su propio máximo de apertura al entrar (R tras coste {c1:.2%}):")
+    for etiqueta, clave in (("QQQ sobre su rango", "True"), ("QQQ no sobre su rango", "False")):
+        s = b[b["flag"] == clave]
+        if s.empty:
+            print(f"  {etiqueta:22s} sin operaciones")
+        else:
+            r1 = s["R_bruto"] - c1 * s["k"]
+            print(f"  {etiqueta:22s} n={len(s):<4d} R medio {r1.mean():+.3f} | acierto {(r1 > 0).mean():.0%}")
+    nb = int((t["variante"] == "BASE").sum())
+    if nb < 100:
+        print(f"\nℹ️ Solo {nb} operaciones BASE: resultado poco concluyente. Haz falta 100 o más antes de sacar conclusiones.")
+    print("Notas: simulación con velas de 1 min; si una vela toca el stop, se asume stop. Los resultados tienen ruido: "
+          "no cambies la estrategia por una diferencia dentro de ±2 errores estándar.")
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 def main(modo):
-    if modo not in ("entrada", "cierre"):
-        print("Uso: python bot_orb.py entrada | cierre")
+    if modo not in ("entrada", "cierre", "sombra", "resumen"):
+        print("Uso: python bot_orb.py entrada | cierre | sombra | resumen")
         return 1
+    if modo == "resumen":
+        resumen_sombra()
+        return 0
     if not iniciar_clientes():
         return 1
+    if modo == "sombra":
+        log("👻 SOMBRA: solo reproduce y anota, NO se envían órdenes")
+        ejecutar_sombra()
+        return 0
     log("🧪 DRY_RUN: se simula, NO se envían órdenes" if DRY_RUN else "🚀 PAPER: se envían órdenes a la cuenta paper")
     if modo == "entrada":
         ejecutar_entrada()
@@ -393,6 +676,9 @@ def main(modo):
         ejecutar_cierre()
     return 0
 
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else ""))
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else ""))
