@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Bot ORB 15 minutos (Opening Range Breakout) - Alpaca, SOLO PAPER TRADING
 Implementa las pautas de orb.txt. No hay modo backtest: opera de verdad en la cuenta paper.
@@ -283,11 +282,15 @@ def ejecutar_entrada():
             activos[s] = r
     n_pos = len(posiciones)
 
-    # 2) Vigilar la ruptura del máximo hasta ENTRADA_HASTA (en DRY_RUN fuera de horario: una sola pasada)
+    # 2) Vigilar la ruptura del máximo hasta ENTRADA_HASTA (con control estricto de tiempo)
     una_pasada = DRY_RUN and ahora_ny() >= fin_ventana
     vueltas = 0
     precios = {}
-    while activos and n_pos < MAX_POSICIONES and (una_pasada or ahora_ny() < fin_ventana):
+    while activos and n_pos < MAX_POSICIONES:
+        if not una_pasada and ahora_ny() >= fin_ventana:
+            log("⏳ Se ha alcanzado el límite de hora de entrada (11:00 NY). Finalizando vigilancia.")
+            break
+
         precios = precios_actuales(activos)
         for s in list(activos):
             p, r = precios.get(s), activos[s]
@@ -676,9 +679,6 @@ def main(modo):
         ejecutar_cierre()
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else ""))
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else ""))
