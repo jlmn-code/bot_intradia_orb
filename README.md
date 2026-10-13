@@ -28,6 +28,21 @@ Cada día añade sus filas a `datos/sombra_orb.csv`, sin duplicar si un cron se 
 - Tiene dos modos más para lanzar a mano: `sombra` (con una fecha opcional para un día que se haya perdido) y `resumen`.
 - Muestra el log de cada ejecución en su página.
 
+# Sigue la técnica de orb.txt? Sí en lo esencial: rango 9:30-9:45, compra al romper el máximo, stop en el mínimo, sin take profit y cierre de fin de día. Hay desviaciones que puse a propósito:
+
+Solo entra hasta las 11:00.
+No persigue si el precio ya está más de un 0,5 % por encima del máximo.
+Descarta stops a menos del 0,2 % o a más del 3 %.
+Compra a mercado al precio actual, no exactamente en el máximo.
+Arriesga un 0,5 % por operación en vez del 100 % del capital.
+Cierra a las 15:35 o 15:50, no con una orden al cierre.
+
+Minutos de Actions. Entre entrada, cierre y sombra, el bot consume unos 90 minutos al día, es decir unos 1.900 al mes, justo en el límite de 2.000 si el repositorio es privado. Si el repositorio es público, no cuenta.
+
+Hay un archivo bot-orb-corregido.yml en mis salidas que no recuerdo haber generado. Ignóralo y usa el bot-orb.yml de ahora.
+
+Si vuelve a pasar, pégame el log de una ejecución concreta, con su hora y el cron que la lanzó, y lo reviso.
+
 **Para que funcione**
 - Si el commit automático falla (aparecerá "No se pudo guardar en el repositorio"), activa *Settings → Actions → General → Workflow permissions → Read and write permissions*.
 - Mantén la variable `DRY_RUN` en `false`, o bórrala, para que el bot real siga operando.
@@ -35,3 +50,18 @@ Cada día añade sus filas a `datos/sombra_orb.csv`, sin duplicar si un cron se 
 **Cómo leerlo**: con 1 o 3 operaciones al día, necesitas meses para llegar a 100 operaciones BASE, y el resumen te avisa mientras sean pocas. No cambies la estrategia por una diferencia que quede dentro de dos errores estándar, y ten en cuenta que la sombra usa velas de 1 minuto con datos de IEX, así que será parecida a la operativa real pero no idéntica.
 
 Para empezar, sube los dos archivos, haz commit, y mañana, después de las 22:25 en Madrid, mira la ejecución de sombra. Pásame el log del primer día y vemos si todo cuadra con lo que hizo el bot real.
+
+¿Sigue la técnica de orb.txt? Sí en lo esencial: rango 9:30-9:45, compra al romper el máximo, stop en el mínimo, sin take profit y cierre de fin de día. Hay desviaciones que puse a propósito:
+
+Solo entra hasta las 11:00.
+No persigue si el precio ya está más de un 0,5 % por encima del máximo.
+Descarta stops a menos del 0,2 % o a más del 3 %.
+Compra a mercado al precio actual, no exactamente en el máximo.
+Arriesga un 0,5 % por operación en vez del 100 % del capital.
+Cierra a las 15:35 o 15:50, no con una orden al cierre.
+
+Minutos de Actions. Entre entrada, cierre y sombra, el bot consume unos 90 minutos al día, es decir unos 1.900 al mes, justo en el límite de 2.000 si el repositorio es privado. Si el repositorio es público, no cuenta.
+
+Hay un archivo bot-orb-corregido.yml en mis salidas que no recuerdo haber generado. Ignóralo y usa el bot-orb.yml de ahora.
+
+Si vuelve a pasar, pégame el log de una ejecución concreta, con su hora y el cron que la lanzó, y lo reviso.
