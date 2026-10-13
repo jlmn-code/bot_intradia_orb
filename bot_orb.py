@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Bot ORB 15 minutos (Opening Range Breakout) - Alpaca, SOLO PAPER TRADING
 Implementa las pautas de orb.txt. No hay modo backtest: opera de verdad en la cuenta paper.
@@ -70,6 +71,9 @@ ENTRADA_HASTA = dtime(11, 0)       # no se abren entradas nuevas a partir de est
 CIERRE_PERMITIDO = (dtime(15, 25), dtime(15, 59))
 POLL_SEG = 15                      # cada cuántos segundos se mira el precio
 MIN_VELAS_RANGO = 12               # de 15 velas de 1 min, mínimo para dar el rango por válido
+# Solo vale la PRIMERA ruptura del día. Si el bot arranca tarde (o se reinicia por un respaldo), se mira qué hizo el
+# precio desde las 9:45: si ya rompió el máximo hace más de TOLERANCIA minutos, esa ruptura ya pasó y no se compra.
+TOLERANCIA_RUPTURA_MIN = int(os.environ.get("ORB_TOLERANCIA_MIN", "5"))
 
 # Filtros de seguridad (no vienen de orb.txt)
 MAX_PERSECUCION_PCT = 0.005        # si al detectar la ruptura el precio ya está >0,5 % sobre el máximo, no se persigue
@@ -194,6 +198,30 @@ def rango_apertura(hoy):
     return salida
 
 
+def rupturas_previas(hoy, rangos):
+    """Símbolos cuyo precio ya superó su máximo del rango desde las 9:45, hace más de TOLERANCIA minutos.
+    Devuelve (set, ok). ok=False si no se pudo comprobar (entonces no se debe entrar a ciegas)."""
+    ini = datetime.combine(hoy, FIN_RANGO, tzinfo=NY)
+    corte = ahora_ny() - timedelta(minutes=TOLERANCIA_RUPTURA_MIN)
+    if corte <= ini:
+        return set(), True              # arranque a tiempo: no hay pasado que revisar
+    try:
+        df = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=list(rangos), timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            start=ini, end=corte, feed=FEED)).df
+    except Exception as e:
+        log(f"❌ No se pudo comprobar si ya hubo ruptura antes: {str(e)[:150]}")
+        return set(), False
+    viejas = set()
+    if df is not None and not df.empty:
+        for sym, g in df.groupby(level="symbol"):
+            g = g.droplevel("symbol").sort_index()
+            g = g[(g.index >= ini) & (g.index < corte)]
+            if len(g) and float(g["high"].max()) > rangos[sym]["alto"]:
+                viejas.add(sym)
+    return viejas, True
+
+
 def precios_actuales(simbolos):
     """Último precio negociado de varios símbolos en una sola llamada. {} si falla."""
     try:
@@ -281,6 +309,20 @@ def ejecutar_entrada():
         else:
             activos[s] = r
     n_pos = len(posiciones)
+    if n_pos >= MAX_POSICIONES:
+        log(f"⚠️ La cuenta ya tiene {n_pos} posiciones (límite {MAX_POSICIONES}, cuenta TODAS las de la cuenta, "
+            f"no solo las de este bot). No se abrirá ninguna entrada nueva.")
+
+    # 1b) Solo la primera ruptura del día: descartar símbolos que ya rompieron antes
+    if activos and not (DRY_RUN and ahora_ny() >= fin_ventana):
+        viejas, ok = rupturas_previas(hoy, activos)
+        if not ok:
+            log("⛔ Sin poder verificar el pasado del precio, no se entra (ORB exige la primera ruptura). Salgo.")
+            return
+        for s_ in sorted(viejas):
+            log(f"   ⏭️ {s_}: ya rompió el máximo hace más de {TOLERANCIA_RUPTURA_MIN} min; esa ruptura ya pasó, "
+                f"no se compra tarde")
+            del activos[s_]
 
     # 2) Vigilar la ruptura del máximo hasta ENTRADA_HASTA (con control estricto de tiempo)
     una_pasada = DRY_RUN and ahora_ny() >= fin_ventana
@@ -340,12 +382,15 @@ def ejecutar_entrada():
             break
         vueltas += 1
         if vueltas % 20 == 0 and activos:
-            log("👀 Vigilando: " + " | ".join(
+            falta = max(0, int((fin_ventana - ahora_ny()).total_seconds() // 60))
+            log(f"👀 Vigilando (quedan {falta} min hasta {ENTRADA_HASTA:%H:%M} NY): " + " | ".join(
                 f"{s} {precios.get(s, float('nan')):.2f}/{r['alto']:.2f}" for s, r in activos.items()))
         time.sleep(POLL_SEG)
 
     if activos:
         log("ℹ️ Sin ruptura (o sin entrada) en: " + ", ".join(activos) + ". Es normal: no se fuerza ninguna entrada.")
+    log(f"📋 Resumen de entrada {hoy}: posiciones en cuenta {n_pos}/{MAX_POSICIONES} | "
+        f"sin ruptura: {', '.join(activos) if activos else 'ninguno'} | fin {ahora_ny():%H:%M:%S} NY")
 
 
 # ==========================================================
