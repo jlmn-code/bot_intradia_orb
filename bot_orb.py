@@ -67,7 +67,7 @@ POOL = ["AAPL", "NVDA", "TSLA", "QQQ"]
 
 APERTURA = dtime(9, 30)
 FIN_RANGO = dtime(9, 45)           # el rango son los primeros 15 minutos
-ENTRADA_HASTA = dtime(11, 0)       # no se abren entradas nuevas a partir de esta hora (NY)
+ENTRADA_HASTA = dtime(13, 0)       # no se abren entradas nuevas a partir de esta hora (NY)
 CIERRE_PERMITIDO = (dtime(15, 25), dtime(15, 59))
 POLL_SEG = 15                      # cada cuántos segundos se mira el precio
 MIN_VELAS_RANGO = 12               # de 15 velas de 1 min, mínimo para dar el rango por válido
