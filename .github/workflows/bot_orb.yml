@@ -1,122 +1,131 @@
-name: Bot Luk (intradía)
+name: Bot ORB
 
-# Horarios en UTC. Cada hora NY tiene su cron de verano (EDT, UTC-4) y de invierno (EST, UTC-5);
-# el script comprueba la hora de Nueva York y se sale si la franja no corresponde.
 on:
   schedule:
-    # screener, 16:35 NY
-    - cron: '35 20 * * 1-5'
-    - cron: '35 21 * * 1-5'
-    # monitor, 9:35 NY (+ respaldo a las 9:50 por si GitHub retrasa o pierde el primero)
-    - cron: '35 13 * * 1-5'
-    - cron: '35 14 * * 1-5'
-    - cron: '50 13 * * 1-5'
-    - cron: '50 14 * * 1-5'
-    # cierre, 15:40 y 15:52 NY
-    - cron: '40 19 * * 1-5'
-    - cron: '40 20 * * 1-5'
-    - cron: '52 19 * * 1-5'
-    - cron: '52 20 * * 1-5'
+    # Entrada: el rango de apertura termina a las 9:45 NY. Se lanza un poco antes (9:43) y con un respaldo 15 min despues.
+    - cron: "43 13 * * 1-5"   # entrada, horario de verano EE. UU.
+    - cron: "58 13 * * 1-5"   # entrada (respaldo), horario de verano
+    - cron: "43 14 * * 1-5"   # entrada, horario de invierno
+    - cron: "58 14 * * 1-5"   # entrada (respaldo), horario de invierno
+    # Cierre: objetivo 15:35 y 15:50 NY
+    - cron: "35 19 * * 1-5"   # cierre, horario de verano
+    - cron: "50 19 * * 1-5"   # cierre (respaldo), horario de verano
+    - cron: "35 20 * * 1-5"   # cierre, horario de invierno
+    - cron: "50 20 * * 1-5"   # cierre (respaldo), horario de invierno
+    # Sombra: tras el cierre del mercado (16:25 y 16:55 NY). Reproduce el dia y anota variantes, sin ordenes.
+    - cron: "25 20 * * 1-5"   # sombra, horario de verano
+    - cron: "55 20 * * 1-5"   # sombra (respaldo), horario de verano
+    - cron: "25 21 * * 1-5"   # sombra, horario de invierno
+    - cron: "55 21 * * 1-5"   # sombra (respaldo), horario de invierno
   workflow_dispatch:
     inputs:
       modo:
-        description: 'Modo a ejecutar'
+        description: "Modo a ejecutar"
         type: choice
-        default: resumen
-        options: [screener, monitor, cierre, resumen, backtest]
-      bt_sesiones:
-        description: 'Backtest: nº de sesiones a reproducir'
-        default: '100'
-      ancla_min:
-        description: 'ANCLA_MIN_SESIONES (screener; prueba 3 para menos filtro)'
-        default: '5'
-      max_ext:
-        description: 'MAX_EXT_EMA21 (screener; 0.08 = 8 % sobre la EMA21)'
-        default: '0.08'
-      multidia:
-        description: 'Backtest multidía (mantener posiciones varios días, trailing EMA9)'
-        type: choice
-        default: 'false'
-        options: ['false', 'true']
-      max_dias:
-        description: 'Backtest multidía: máx. sesiones en posición'
-        default: '10'
-      dry_run:
-        description: 'DRY_RUN (auto = usa la variable del repo, por defecto true)'
-        type: choice
-        default: auto
-        options: [auto, 'true', 'false']
+        options:
+          - entrada
+          - cierre
+          - sombra
+          - resumen
+        default: entrada
+      fecha:
+        description: "Solo para sombra: dia a reproducir (AAAA-MM-DD). Vacio = hoy"
+        type: string
+        default: ""
 
+# Necesario para que el workflow pueda guardar la carpeta datos/ en el repositorio
 permissions:
   contents: write
 
 concurrency:
-  group: bot-luk
+  group: bot-orb
   cancel-in-progress: false
 
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.inputs.modo == 'backtest' && 150 || 75 }}
-    env:
-      # Secretos propios del bot Luk; si no existen, usa los genéricos APCA_*
-      APCA_API_KEY_ID: ${{ secrets.API_KEY_LUK || secrets.APCA_API_KEY_ID }}
-      APCA_API_SECRET_KEY: ${{ secrets.SECRET_KEY_LUK || secrets.APCA_API_SECRET_KEY }}
-      DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
-      DRY_RUN_MANUAL: ${{ github.event.inputs.dry_run || 'auto' }}
-      PAPER: 'true'
-      PROGRAMADO: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
-      SCHED: ${{ github.event.schedule }}
-      MODO_MANUAL: ${{ github.event.inputs.modo }}
-      # Hora NY hasta la que el monitor vigila entradas (cada minuto de más gasta minutos de Actions).
-      # Se puede cambiar sin tocar el archivo: variable del repo ENTRADA_HASTA (p. ej. 10:15).
-      ENTRADA_HASTA: ${{ vars.ENTRADA_HASTA || '10:30' }}
-      BT_SESIONES: ${{ github.event.inputs.bt_sesiones || '100' }}
-      ANCLA_MIN_SESIONES: ${{ github.event.inputs.ancla_min || '5' }}
-      MAX_EXT_EMA21: ${{ github.event.inputs.max_ext || '0.08' }}
-      BT_MULTIDIA: ${{ github.event.inputs.multidia || 'false' }}
-      BT_MAX_DIAS: ${{ github.event.inputs.max_dias || '10' }}
-      # Parámetros opcionales (descomenta para cambiarlos)
-      # RIESGO_PCT: '0.005'
-      # MANTENER_NOCHE: 'false'
-      # FEED_DIARIO: 'sip'
-      # FEED_INTRA: 'iex'
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Instalar Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install alpaca-py pandas numpy
+        run: pip install alpaca-py pandas
 
-      - name: Elegir modo
+      - name: Ejecutar el bot
+        shell: bash
+        env:
+          API_KEY_ORB: ${{ secrets.API_KEY_ORB }}
+          SECRET_KEY_ORB: ${{ secrets.SECRET_KEY_ORB }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
+          EVENTO: ${{ github.event_name }}
+          PROGRAMACION: ${{ github.event.schedule }}
+          MODO_MANUAL: ${{ inputs.modo }}
+          FECHA_SOMBRA: ${{ inputs.fecha }}
         run: |
-          if [ -n "$MODO_MANUAL" ]; then
+          if [ "$EVENTO" = "workflow_dispatch" ]; then
             MODO="$MODO_MANUAL"
           else
-            case "$SCHED" in
-              "35 20 * * 1-5"|"35 21 * * 1-5") MODO=screener ;;
-              "35 13 * * 1-5"|"35 14 * * 1-5"|"50 13 * * 1-5"|"50 14 * * 1-5") MODO=monitor ;;
-              "40 19 * * 1-5"|"40 20 * * 1-5"|"52 19 * * 1-5"|"52 20 * * 1-5") MODO=cierre ;;
-              *) echo "Cron desconocido: $SCHED"; exit 1 ;;
+            case "$PROGRAMACION" in
+              "43 13 * * 1-5"|"58 13 * * 1-5"|"43 14 * * 1-5"|"58 14 * * 1-5") MODO="entrada" ;;
+              "35 19 * * 1-5"|"50 19 * * 1-5"|"35 20 * * 1-5"|"50 20 * * 1-5") MODO="cierre" ;;
+              "25 20 * * 1-5"|"55 20 * * 1-5"|"25 21 * * 1-5"|"55 21 * * 1-5") MODO="sombra" ;;
+              *) echo "Programacion desconocida: $PROGRAMACION"; exit 1 ;;
             esac
           fi
-          echo "MODO=$MODO" >> "$GITHUB_ENV"
-          echo "Hora NY ahora: $(TZ=America/New_York date '+%F %H:%M')  ->  modo $MODO"
 
-      - name: Ejecutar bot
-        run: python bot_intradia_luk.py "$MODO"
-
-      - name: Guardar datos en el repo
-        if: always()
-        run: |
-          git config user.name "bot-luk"
-          git config user.email "bot-luk@users.noreply.github.com"
-          git add datos 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "datos bot_luk ($MODO) $(date -u +%F)"
-            git pull --rebase --autostash || true
-            git push || echo "No se pudo hacer push de datos"
+          # Hora real en Nueva York (minutos desde medianoche). Una ejecucion programada solo actua si cae dentro
+          # de su franja: entrada 9:30-10:45, cierre 15:25-15:59, sombra 16:10-17:30 (hora de NY).
+          # Asi los crons de la otra estacion no hacen nada.
+          HORA_NY=$(TZ=America/New_York date +%H:%M)
+          MIN_NY=$(( 10#$(TZ=America/New_York date +%H) * 60 + 10#$(TZ=America/New_York date +%M) ))
+          if [ "$EVENTO" = "schedule" ]; then
+            if [ "$MODO" = "entrada" ] && { [ "$MIN_NY" -lt 570 ] || [ "$MIN_NY" -gt 645 ]; }; then
+              echo "Fuera de la franja de entrada (9:30-10:45 NY); son las $HORA_NY. Salgo."; exit 0
+            fi
+            if [ "$MODO" = "cierre" ] && { [ "$MIN_NY" -lt 925 ] || [ "$MIN_NY" -gt 959 ]; }; then
+              echo "Fuera de la franja de cierre (15:25-15:59 NY); son las $HORA_NY. Salgo."; exit 0
+            fi
+            if [ "$MODO" = "sombra" ] && { [ "$MIN_NY" -lt 970 ] || [ "$MIN_NY" -gt 1050 ]; }; then
+              echo "Fuera de la franja de sombra (16:10-17:30 NY); son las $HORA_NY. Salgo."; exit 0
+            fi
           fi
+
+          echo "Modo: $MODO | Hora NY: $HORA_NY | DRY_RUN=$DRY_RUN"
+          python -u bot_orb.py "$MODO" 2>&1 | tee salida_orb.txt
+
+      - name: Mostrar el log en la pagina de la ejecucion
+        if: always()
+        shell: bash
+        run: |
+          if [ -f salida_orb.txt ]; then
+            { echo '```'; cat salida_orb.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Guardar datos en el repositorio
+        if: always()
+        shell: bash
+        run: |
+          if [ -d datos ] && [ -n "$(git status --porcelain datos)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add datos
+            git commit -m "datos ORB $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push || echo "No se pudo guardar en el repositorio: revisa Settings > Actions > General > Workflow permissions (Read and write)."
+          fi
+
+      - name: Guardar registros como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registros-orb-${{ github.run_id }}
+          path: |
+            datos/*.csv
+            salida_orb.txt
+          if-no-files-found: ignore
